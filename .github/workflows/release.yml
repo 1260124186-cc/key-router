@@ -1,0 +1,220 @@
+name: Release
+
+# Manual-only release workflow. Pushing code to main does NOT publish a
+# release — run this workflow from the Actions tab (workflow_dispatch) when a
+# release is wanted. The version is bumped automatically (patch) unless an
+# explicit version like "v1.2.3" is typed in the dialog.
+# Builds run on each platform's own runner because the WebView2 / WKWebView /
+# WebKit2GTK bindings are cgo-based and cannot be cross-compiled.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Optional explicit version (e.g. v1.2.3). Leave empty to auto-bump the patch version.'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+# Serialize release runs: two manual triggers at once would otherwise compute
+# the same next tag and one of the tag pushes would fail.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      ver: ${{ steps.resolve.outputs.ver }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version (explicit or auto-bump)
+        id: resolve
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            tag="${{ inputs.version }}"
+          else
+            latest=$(git tag --list 'v*' --sort=-v:refname | head -n1 || true)
+            if [ -z "$latest" ]; then
+              tag="v0.1.0"
+            else
+              base=${latest#v}
+              IFS='.' read -r maj min pat <<< "$base"
+              pat="${pat%%-*}"   # tolerate prerelease tags like v1.2.3-beta
+              tag="v${maj}.${min}.$((pat + 1))"
+            fi
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          # Numeric version (no 'v') for -X ldflags, NSIS, Info.plist, deb:
+          # the window title formats it as "KeyRouter v$ver", so passing the
+          # tag verbatim would produce "vv0.1.4".
+          echo "ver=${tag#v}" >> "$GITHUB_OUTPUT"
+          echo "Resolved tag: $tag"
+
+      - name: Create and push tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag "${{ steps.resolve.outputs.tag }}"
+          git push origin "${{ steps.resolve.outputs.tag }}"
+
+  build:
+    name: Build ${{ matrix.name }}
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows amd64
+            os: windows-latest
+            asset: KeyRouter-${{ needs.version.outputs.tag }}-windows-amd64.exe
+          - name: macOS arm64
+            os: macos-latest
+            arch: arm64
+            asset: KeyRouter-${{ needs.version.outputs.tag }}-darwin-arm64
+          - name: macOS amd64 (Intel)
+            os: macos-15-intel
+            arch: amd64
+            asset: KeyRouter-${{ needs.version.outputs.tag }}-darwin-amd64
+          - name: Linux amd64
+            os: ubuntu-22.04
+            asset: KeyRouter-${{ needs.version.outputs.tag }}-linux-amd64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build web UI
+        run: |
+          npm ci
+          npm run build
+        working-directory: web
+
+      - name: Install Linux WebKit dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.0-dev libgtk-3-dev
+
+      - name: Add MSYS2 MinGW to PATH (Windows cgo)
+        if: runner.os == 'Windows'
+        run: echo "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Build binary
+        run: |
+          go build -trimpath -ldflags "-s -w -X main.version=${{ needs.version.outputs.ver }} -X key-router/handler.version=${{ needs.version.outputs.ver }}" -o ${{ matrix.asset }} .
+
+      # ---- Windows: NSIS installer ----
+      - name: Build Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          New-Item -ItemType Directory -Force dist | Out-Null
+          choco install nsis -y --no-progress
+          # choco's nsis package creates no shim; NSIS installs here:
+          $env:PATH += ";C:\Program Files (x86)\NSIS"
+          makensis /DTAG="${{ needs.version.outputs.tag }}" /DVERSION="${{ needs.version.outputs.ver }}" "/DAPP_EXE=${{ github.workspace }}\${{ matrix.asset }}" packaging/windows/installer.nsi
+          Copy-Item "${{ matrix.asset }}" "dist\${{ matrix.asset }}"
+
+      # ---- macOS: .app bundle + DMG ----
+      - name: Build macOS app bundle and DMG
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          mkdir -p dist "KeyRouter.app/Contents/MacOS" "KeyRouter.app/Contents/Resources"
+          cp "${{ matrix.asset }}" "KeyRouter.app/Contents/MacOS/KeyRouter"
+          chmod +x "KeyRouter.app/Contents/MacOS/KeyRouter"
+          sed "s/@VERSION@/${{ needs.version.outputs.ver }}/" packaging/macos/Info.plist > "KeyRouter.app/Contents/Info.plist"
+          # Generate .icns from the committed 512px PNG (sips + iconutil are built-in).
+          mkdir -p KeyRouter.iconset
+          for s in 16 32 64 128 256 512; do
+            sips -z $s $s packaging/icon/app-icon-512.png --out "KeyRouter.iconset/icon_${s}x${s}.png" >/dev/null
+            sips -z $((s*2)) $((s*2)) packaging/icon/app-icon-512.png --out "KeyRouter.iconset/icon_${s}x${s}@2x.png" >/dev/null
+          done
+          iconutil -c icns KeyRouter.iconset -o "KeyRouter.app/Contents/Resources/app.icns"
+          codesign --force --deep -s - "KeyRouter.app"
+          hdiutil create -volname "KeyRouter" -srcfolder "KeyRouter.app" -ov -format UDZO "dist/KeyRouter-${{ needs.version.outputs.tag }}-darwin-${{ matrix.arch }}.dmg"
+          cp "${{ matrix.asset }}" "dist/${{ matrix.asset }}"
+
+      # ---- Linux: .deb + .tar.gz ----
+      - name: Build Linux packages
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          mkdir -p dist pkg/DEBIAN pkg/usr/bin pkg/usr/share/applications pkg/usr/share/icons/hicolor/512x512/apps
+          install -m 0755 "${{ matrix.asset }}" pkg/usr/bin/keyrouter
+          sed "s/@VERSION@/${{ needs.version.outputs.ver }}/" packaging/linux/control > pkg/DEBIAN/control
+          install -m 0644 packaging/linux/keyrouter.desktop pkg/usr/share/applications/
+          install -m 0644 packaging/icon/app-icon-512.png pkg/usr/share/icons/hicolor/512x512/apps/keyrouter.png
+          dpkg-deb --build --root-owner-group pkg "dist/KeyRouter-${{ needs.version.outputs.tag }}-linux-amd64.deb"
+          tar -czf "dist/KeyRouter-${{ needs.version.outputs.tag }}-linux-amd64.tar.gz" "${{ matrix.asset }}"
+          cp "${{ matrix.asset }}" "dist/${{ matrix.asset }}"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/**
+
+  release:
+    name: Publish release
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          name: KeyRouter ${{ needs.version.outputs.tag }}
+          body: |
+            ## KeyRouter ${{ needs.version.outputs.tag }}
+
+            Automated release — built from `main`.
+
+            ### Windows
+            - **Installer**: `KeyRouter-${{ needs.version.outputs.tag }}-windows-amd64-setup.exe`
+            - Portable: `KeyRouter-${{ needs.version.outputs.tag }}-windows-amd64.exe`
+
+            ### macOS
+            - **DMG (Apple Silicon)**: `KeyRouter-${{ needs.version.outputs.tag }}-darwin-arm64.dmg`
+            - **DMG (Intel)**: `KeyRouter-${{ needs.version.outputs.tag }}-darwin-amd64.dmg`
+            - Portable binaries for both architectures are also published.
+
+            ### Linux
+            - **Debian/Ubuntu package**: `KeyRouter-${{ needs.version.outputs.tag }}-linux-amd64.deb` (built for Ubuntu 22.04 / Debian 12; needs WebKitGTK 4.0 / GTK 3)
+            - **tar.gz**: `KeyRouter-${{ needs.version.outputs.tag }}-linux-amd64.tar.gz`
+            - Portable: `KeyRouter-${{ needs.version.outputs.tag }}-linux-amd64`
+
+            > All build types store their data in the system application-data
+            > directory (e.g. `%LOCALAPPDATA%\KeyRouter` on Windows) — never
+            > next to the executable — so upgrades never lose your keys,
+            > routes, or billing history.
+
+            KeyRouter is licensed under the [GNU Affero General Public License v3.0](https://www.gnu.org/licenses/agpl-3.0.html).
+          files: artifacts/**
+          generate_release_notes: true

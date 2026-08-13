@@ -1,0 +1,116 @@
+import React, { useEffect, useState } from 'react';
+import { BrowserRouter, Routes, Route, Link, useLocation } from 'react-router-dom';
+import {
+  Layout, Menu, Typography, theme, ConfigProvider, Alert, Button, Space,
+} from 'antd';
+import {
+  DashboardOutlined,
+  CloudServerOutlined,
+  AppstoreOutlined,
+  BarChartOutlined,
+  SettingOutlined,
+  QuestionCircleOutlined,
+  DownloadOutlined,
+} from '@ant-design/icons';
+
+import Dashboard from './pages/Dashboard';
+import Providers from './pages/Providers';
+import Models from './pages/Models';
+import Activity from './pages/Activity';
+import Settings from './pages/Settings';
+import Help from './pages/Help';
+import ErrorBoundary from './components/ErrorBoundary';
+import { getAutoCheckState } from './api/client';
+
+const { Sider, Content } = Layout;
+const { Title } = Typography;
+
+// LayoutWithRouter is rendered inside BrowserRouter context so useLocation() works
+const LayoutWithRouter: React.FC = () => {
+  const [collapsed, setCollapsed] = useState(false);
+  const [updateInfo, setUpdateInfo] = useState<any>(null);
+  const location = useLocation();
+
+  // Auto-update check result: the app checks on startup + daily (backend);
+  // here we surface a banner when a new version exists — no auto-apply.
+  useEffect(() => {
+    getAutoCheckState()
+      .then(res => { if (res.data?.update_available) setUpdateInfo(res.data); })
+      .catch(() => {});
+  }, []);
+
+  const menuItems = [
+    { key: '/', icon: <DashboardOutlined />, label: <Link to="/">Dashboard</Link> },
+    { type: 'divider' as const },
+    { key: '/providers', icon: <CloudServerOutlined />, label: <Link to="/providers">Providers</Link> },
+    { key: '/models', icon: <AppstoreOutlined />, label: <Link to="/models">Models</Link> },
+    { type: 'divider' as const },
+    { key: '/stats', icon: <BarChartOutlined />, label: <Link to="/stats">Activity</Link> },
+    { key: '/settings', icon: <SettingOutlined />, label: <Link to="/settings">Settings</Link> },
+    { key: '/help', icon: <QuestionCircleOutlined />, label: <Link to="/help">Help</Link> },
+  ];
+
+  return (
+    <Layout style={{ minHeight: '100vh' }}>
+      {/* Sider is fixed; only the content column scrolls */}
+      <Sider
+        collapsible
+        collapsed={collapsed}
+        onCollapse={setCollapsed}
+        style={{ position: 'fixed', left: 0, top: 0, bottom: 0, height: '100vh', overflow: 'auto', zIndex: 10 }}
+      >
+        <div style={{ height: 64, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <Title level={4} style={{ color: '#fff', margin: 0 }}>
+            {collapsed ? 'KR' : 'KeyRouter'}
+          </Title>
+        </div>
+        <Menu
+          theme="dark"
+          mode="inline"
+          selectedKeys={[location.pathname]}
+          items={menuItems}
+        />
+      </Sider>
+      <Layout style={{ marginLeft: collapsed ? 80 : 200, minHeight: '100vh' }}>
+        <Content style={{ margin: 24 }}>
+          {updateInfo && (
+            <Alert
+              type="info"
+              showIcon
+              style={{ marginBottom: 16 }}
+              message={`KeyRouter ${updateInfo.latest_version} is available`}
+              description={
+                <Space>
+                  <span>You are running {updateInfo.current_version}. Update is not applied automatically.</span>
+                  <Button size="small" type="primary" icon={<DownloadOutlined />} onClick={() => window.location.hash = '#/settings'}>
+                    Go to Settings to update
+                  </Button>
+                </Space>
+              }
+            />
+          )}
+          <Routes>
+            <Route path="/" element={<ErrorBoundary><Dashboard /></ErrorBoundary>} />
+            <Route path="/providers" element={<ErrorBoundary><Providers /></ErrorBoundary>} />
+            <Route path="/models" element={<ErrorBoundary><Models /></ErrorBoundary>} />
+            <Route path="/settings" element={<ErrorBoundary><Settings /></ErrorBoundary>} />
+            <Route path="/stats" element={<ErrorBoundary><Activity /></ErrorBoundary>} />
+            <Route path="/help" element={<ErrorBoundary><Help /></ErrorBoundary>} />
+          </Routes>
+        </Content>
+      </Layout>
+    </Layout>
+  );
+};
+
+const App: React.FC = () => {
+  return (
+    <ConfigProvider theme={{ algorithm: theme.defaultAlgorithm }}>
+      <BrowserRouter>
+        <LayoutWithRouter />
+      </BrowserRouter>
+    </ConfigProvider>
+  );
+};
+
+export default App;

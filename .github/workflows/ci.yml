@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  go:
+    name: Go checks
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install WebKit/GTK dependencies (cgo)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.0-dev libgtk-3-dev
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
+      - name: Format check
+        run: |
+          gofmt -l . | tee /dev/stderr
+          test -z "$(gofmt -l .)"
+
+  web:
+    name: Web UI build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+        working-directory: web
+
+      - name: Type-check and build
+        run: npm run build
+        working-directory: web
+
+      # Dependabot bumps package.json/package-lock.json but cannot rebuild the
+      # committed web/dist, which would fail the check below and leave the PR
+      # permanently red. For same-repo PRs (dependabot, local branches) rebuild
+      # the UI on the PR head branch and commit the result back; forks keep the
+      # strict check (they must commit dist themselves).
+      - name: Refresh committed dist on PR branch
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch --depth=1 origin "${{ github.event.pull_request.head.ref }}"
+          git checkout --detach FETCH_HEAD
+          (cd web && npm ci && npm run build)
+          if ! git diff --exit-code -- web/dist >/dev/null; then
+            git add web/dist
+            git commit -m "chore: refresh web/dist"
+            git push origin "HEAD:${{ github.event.pull_request.head.ref }}"
+          fi
+
+      - name: Verify committed dist is up to date
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+        run: |
+          git diff --exit-code -- web/dist || (echo "web/dist is out of date — run 'cd web && npm run build' and commit the result" && exit 1)

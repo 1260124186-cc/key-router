@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=KeyRouter
+Comment=Local AI API gateway
+Exec=keyrouter
+Icon=keyrouter
+Terminal=false
+Categories=Network;Utility;
