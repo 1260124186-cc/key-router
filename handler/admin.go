@@ -559,10 +559,15 @@ func (h *AdminHandler) DeleteModelGroup(c *gin.Context) {
 	c.JSON(http.StatusNoContent, nil)
 }
 
-// GetRoutes returns all routes, ordered by priority (drag position)
+// GetRoutes returns all routes. priority is per-model-group (0..n-1 within
+// each group), so values collide across groups; ordering by model_group_id
+// first (then priority, then id as a deterministic tiebreaker) keeps each
+// group's routes contiguous and stable — otherwise ties interleave routes
+// from other groups and a refresh visibly scrambles the drag order.
 func (h *AdminHandler) GetRoutes(c *gin.Context) {
 	var routes []model.Route
-	query := db.GetDB().Preload("ModelGroup").Preload("Provider").Order("priority ASC")
+	query := db.GetDB().Preload("ModelGroup").Preload("Provider").
+		Order("model_group_id ASC, priority ASC, id ASC")
 	if groupID := c.Query("model_group_id"); groupID != "" {
 		query = query.Where("model_group_id = ?", groupID)
 	}

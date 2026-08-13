@@ -34,6 +34,12 @@ const Models: React.FC = () => {
   const [groupForm] = Form.useForm();
   const [routeForm] = Form.useForm();
   const persistTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // True while a drag-reorder is debounced-but-not-yet-persisted. The 10s
+  // background poll would otherwise overwrite the local order with the
+  // server's stale sequence (the route priorities haven't been saved yet),
+  // making the just-dragged rows jump back — and shifting the flat-array
+  // indices the drag uses, so the next drop could land on the wrong route.
+  const pendingOrder = useRef(false);
   const routesRef = useRef<Route[]>([]);
   routesRef.current = routes;
 
@@ -59,12 +65,19 @@ const Models: React.FC = () => {
   // groups and scroll position — only row data updates.
   useEffect(() => {
     const t = setInterval(() => {
+      // Don't clobber the local route order mid-drag or while a reorder is
+      // still debounced: the server hasn't seen it yet, so overwriting would
+      // revert the visible order and desync the drag indices. groups/providers
+      // still refresh (they aren't affected by route drag).
       Promise.all([getModelGroups(), getRoutes(), getProviders()])
-        .then(([g, r, p]) => { setGroups(g.data); setRoutes(r.data); setProviders(p.data); })
+        .then(([g, r, p]) => {
+          setGroups(g.data); setProviders(p.data);
+          if (!drag.dragging && !pendingOrder.current) setRoutes(r.data);
+        })
         .catch(() => {});
     }, 10000);
     return () => clearInterval(t);
-  }, []);
+  }, [drag.dragging]);
 
   // ---- Model Group CRUD ----
   const saveGroup = async () => {
@@ -105,6 +118,7 @@ const Models: React.FC = () => {
 
   const persistOrder = useCallback((ordered: Route[]) => {
     if (persistTimer.current) clearTimeout(persistTimer.current);
+    pendingOrder.current = true;
     persistTimer.current = setTimeout(async () => {
       const groupCounts: Record<number, number> = {};
       const payload = ordered.map(r => {
@@ -113,6 +127,7 @@ const Models: React.FC = () => {
         return { id: r.id, priority: idx };
       });
       try { await reorderRoutes(payload); } catch { message.error('Failed to save order'); }
+      finally { pendingOrder.current = false; }
     }, 300);
   }, []);
 
